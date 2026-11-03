@@ -8,7 +8,7 @@ export const DEFAULT_SETTINGS: Settings = {
   offline: false,
   autoAnswer: false,
   asr: { backend: 'cpu', model: 'base', language: 'ru', vocabulary: ['PostgreSQL', 'FastAPI', 'Kubernetes', 'Docker', 'React', 'TypeScript'], threads: 6 },
-  audio: { micDeviceId: null, captureMic: true, captureSystem: true },
+  audio: { micDeviceId: null, systemDeviceId: null, captureMic: true, captureSystem: true },
   contextWindowMin: 3,
   overlay: {
     bounds: null,

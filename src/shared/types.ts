@@ -1,4 +1,13 @@
 export type Source = 'user' | 'remote'
+export interface PlaybackDevice {
+  id: string
+  label: string
+}
+export interface SystemAudioMessage {
+  token: string
+  pcm?: ArrayBuffer
+  error?: string
+}
 export type Lang = 'ru' | 'uk' | 'en'
 export type UiLang = Lang
 
@@ -204,7 +213,7 @@ export interface Settings {
   offline: boolean
   autoAnswer: boolean
   asr: { backend: 'cpu' | 'cuda'; model: string; language: 'auto' | Lang; vocabulary: string[]; threads: number }
-  audio: { micDeviceId: string | null; captureMic: boolean; captureSystem: boolean }
+  audio: { micDeviceId: string | null; systemDeviceId: string | null; captureMic: boolean; captureSystem: boolean }
   contextWindowMin: number
   overlay: OverlaySettings
   shortcuts: Record<ShortcutAction, string>

@@ -22,6 +22,7 @@ const api = {
   onSettings: on('km:settings'),
   onAsr: on('km:asr'),
   onCapture: on('km:capture'),
+  onSystemAudio: on('km:system-audio'),
   onScroll: on('km:scroll'),
   onPickerInit: on('km:picker-init'),
   sendAudio: (m: unknown) => ipcRenderer.send('km:audio', m),

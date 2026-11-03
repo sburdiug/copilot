@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { AsrStatus, Lang, Source } from '@shared/types'
+import type { AsrStatus, Lang, Source, PlaybackDevice } from '@shared/types'
 import { api } from '../../lib/api'
 import { probeLevel } from '../../lib/audio'
 import type { Ctx } from '../App'
@@ -129,12 +129,22 @@ function Probe({ source, deviceId }: { source: Source; deviceId: string | null }
 
 export function DeviceSettings({ ctx }: { ctx: Ctx }) {
   const [mics, setMics] = useState<MediaDeviceInfo[]>([])
+  const [outputs, setOutputs] = useState<PlaybackDevice[]>([])
+  const [outputError, setOutputError] = useState<string | null>(null)
   useEffect(() => {
-    const load = () =>
-      navigator.mediaDevices
+    const load = () => {
+      void navigator.mediaDevices
         .enumerateDevices()
         .then((d) => setMics(d.filter((x) => x.kind === 'audioinput')))
         .catch(() => setMics([]))
+      void api.systemAudio
+        .devices()
+        .then((devices) => {
+          setOutputs(devices)
+          setOutputError(null)
+        })
+        .catch((e) => setOutputError(String(e)))
+    }
     void navigator.mediaDevices
       .getUserMedia({ audio: true })
       .then((s) => s.getTracks().forEach((t) => t.stop()))
@@ -144,19 +154,18 @@ export function DeviceSettings({ ctx }: { ctx: Ctx }) {
     return () => navigator.mediaDevices.removeEventListener('devicechange', load)
   }, [])
   const a = ctx.settings.audio
+  const inputs = mics.filter((m) => m.deviceId && m.deviceId !== 'default' && m.deviceId !== 'communications')
   return (
     <div className="grid2">
       <div className="col">
         <Toggle on={a.captureMic} onChange={(v) => void ctx.patch({ audio: { captureMic: v } })} label="Мой микрофон" hint="Ваша речь — источник «user»" />
         <select className="input" value={a.micDeviceId ?? ''} onChange={(e) => void ctx.patch({ audio: { micDeviceId: e.target.value || null } })}>
           <option value="">Системный по умолчанию</option>
-          {mics
-            .filter((m) => m.deviceId && m.deviceId !== 'default' && m.deviceId !== 'communications')
-            .map((m) => (
-              <option key={m.deviceId} value={m.deviceId}>
-                {m.label || 'Микрофон'}
-              </option>
-            ))}
+          {inputs.map((m) => (
+            <option key={m.deviceId} value={m.deviceId}>
+              {m.label || 'Микрофон'}
+            </option>
+          ))}
         </select>
         <Probe source="user" deviceId={a.micDeviceId} />
       </div>
@@ -164,11 +173,27 @@ export function DeviceSettings({ ctx }: { ctx: Ctx }) {
         <Toggle
           on={a.captureSystem}
           onChange={(v) => void ctx.patch({ audio: { captureSystem: v } })}
-          label="Звук собеседника (системный звук)"
-          hint="WASAPI loopback: весь звук, который играет Windows. Захват отдельного приложения пока не поддерживается."
+          label="Звук собеседника"
+          hint="Звук с выбранного устройства воспроизведения: наушников, динамиков или канала Sonar."
         />
+        <label className="field">
+          <span>Источник звука собеседника — устройство воспроизведения</span>
+          <select className="input" value={a.systemDeviceId ?? ''} onChange={(e) => void ctx.patch({ audio: { systemDeviceId: e.target.value || null } })}>
+            <option value="">Автоматически — системный звук</option>
+            {a.systemDeviceId && !outputs.some((m) => m.id === a.systemDeviceId) && <option value={a.systemDeviceId}>Выбранное устройство недоступно</option>}
+            {outputs.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <ErrorText text={outputError} />
+        <div className="small muted">
+          Sonar: Chat — звук звонка, Media — видео, наушники — итоговый звук. Режим стримера не требуется. Выбор применяется при запуске новой сессии.
+        </div>
         <div className="small muted">Совет: наушники убирают эхо собеседника в микрофоне.</div>
-        <Probe source="remote" deviceId={null} />
+        <Probe source="remote" deviceId={a.systemDeviceId} />
       </div>
     </div>
   )

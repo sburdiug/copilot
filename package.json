@@ -6,6 +6,8 @@
   "main": "out/main/index.js",
   "private": true,
   "scripts": {
+    "predev": "node scripts/build-loopback.cjs",
+    "prebuild": "node scripts/build-loopback.cjs",
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "start": "electron-vite preview",
@@ -38,6 +40,7 @@
   },
   "author": "Copilot",
   "build": {
+    "beforePack": "scripts/build-loopback.cjs",
     "appId": "app.copilot",
     "productName": "Copilot",
     "directories": {
@@ -54,6 +57,10 @@
       "node_modules/onnxruntime-node/**"
     ],
     "extraResources": [
+      {
+        "from": "resources/bin/loopback.exe",
+        "to": "loopback.exe"
+      },
       {
         "from": "resources/silero_vad.onnx",
         "to": "silero_vad.onnx"
