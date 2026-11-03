@@ -139,6 +139,7 @@ interface Channel {
 export interface CaptureOptions {
   sessionId: string
   micDeviceId: string | null
+  systemDeviceId: string | null
   captureMic: boolean
   captureSystem: boolean
 }
@@ -147,6 +148,8 @@ export class CaptureController {
   private channels: Partial<Record<Source, Channel>> = {}
   private opts: CaptureOptions | null = null
   private restarts: Record<Source, number> = { user: 0, remote: 0 }
+  private reopening = new Set<Source>()
+  private captureVersion = 0
   private outputSig: string | null = null
   private onDeviceChange = () => void this.handleDeviceChange()
 
@@ -154,11 +157,11 @@ export class CaptureController {
     await this.stop()
     this.opts = opts
     this.restarts = { user: 0, remote: 0 }
-    navigator.mediaDevices.addEventListener('devicechange', this.onDeviceChange)
     if (opts.captureMic) await this.open('user')
     else km.sendAudioStatus({ source: 'user', state: 'off', label: 'выключен в настройках' })
     if (opts.captureSystem) await this.open('remote')
     else km.sendAudioStatus({ source: 'remote', state: 'off', label: 'выключен в настройках' })
+    if (this.opts === opts) navigator.mediaDevices.addEventListener('devicechange', this.onDeviceChange)
   }
 
   async pause(): Promise<void> {
@@ -174,6 +177,7 @@ export class CaptureController {
   }
 
   async stop(): Promise<void> {
+    this.captureVersion++
     navigator.mediaDevices.removeEventListener('devicechange', this.onDeviceChange)
     for (const src of Object.keys(this.channels) as Source[]) await this.close(src, true)
     this.opts = null
@@ -182,11 +186,21 @@ export class CaptureController {
   private async open(source: Source): Promise<void> {
     const o = this.opts
     if (!o) return
+    const version = this.captureVersion
     try {
-      const stream = source === 'user' ? await openMic(o.micDeviceId) : await openLoopback()
+      const stream = source === 'user' ? await openMic(o.micDeviceId) : await openSystemAudio(o.systemDeviceId)
+      if (version !== this.captureVersion) {
+        for (const t of stream.getTracks()) t.stop()
+        return
+      }
       const ctx = new AudioContext({ sampleRate: RATE, latencyHint: 'interactive' })
       if (!workletUrl) workletUrl = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }))
       await ctx.audioWorklet.addModule(workletUrl)
+      if (version !== this.captureVersion) {
+        for (const t of stream.getTracks()) t.stop()
+        await ctx.close().catch(() => {})
+        return
+      }
       const node = new AudioWorkletNode(ctx, 'km-pcm')
       ctx.createMediaStreamSource(stream).connect(node)
       const send = (u: Utterance, final: boolean) =>
@@ -204,15 +218,15 @@ export class CaptureController {
       for (const t of stream.getAudioTracks()) t.addEventListener('ended', () => void this.reopen(source, 'устройство отключено'))
       this.channels[source] = ch
       this.restarts[source] = 0 // only consecutive failures should count toward the reopen cap
-      if (source === 'remote') this.outputSig = outputSignature(await navigator.mediaDevices.enumerateDevices())
+      if (source === 'remote' && !o.systemDeviceId) this.outputSig = outputSignature(await navigator.mediaDevices.enumerateDevices())
       const label = stream.getAudioTracks()[0]?.label || (source === 'user' ? 'микрофон' : 'системный звук')
-      km.sendAudioStatus({ source, state: 'ok', label: source === 'remote' ? 'весь звук Windows (loopback)' : label })
+      km.sendAudioStatus({ source, state: 'ok', label: source === 'remote' && !o.systemDeviceId ? 'звук вывода по умолчанию (loopback)' : label })
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       km.sendAudioStatus({
         source,
         state: 'error',
-        label: source === 'user' ? `микрофон недоступен: ${msg}. Выберите другое устройство в настройках` : `системный звук недоступен: ${msg}`
+        label: source === 'user' ? `микрофон недоступен: ${msg}. Выберите другое устройство в настройках` : `звук собеседника недоступен: ${msg}`
       })
     }
   }
@@ -231,24 +245,36 @@ export class CaptureController {
   }
 
   private async reopen(source: Source, why: string): Promise<void> {
-    if (!this.opts || this.restarts[source]++ > 5) return
-    await this.close(source, true)
-    km.sendAudioStatus({ source, state: 'warn', label: `${why} — переподключаюсь…` })
-    await new Promise((r) => setTimeout(r, 500))
-    await this.open(source)
+    if (!this.opts || this.reopening.has(source) || this.restarts[source]++ > 5) return
+    const version = this.captureVersion
+    this.reopening.add(source)
+    try {
+      await this.close(source, true)
+      km.sendAudioStatus({ source, state: 'warn', label: `${why} — переподключаюсь…` })
+      await new Promise((r) => setTimeout(r, 500))
+      if (version === this.captureVersion) await this.open(source)
+    } finally {
+      this.reopening.delete(source)
+    }
   }
 
   private async handleDeviceChange(): Promise<void> {
     if (!this.opts) return
     const devices = await navigator.mediaDevices.enumerateDevices()
+    if (!this.opts) return
     const mic = this.channels.user
     if (mic) {
       const id = mic.stream.getAudioTracks()[0]?.getSettings().deviceId
       const gone = !devices.some((d) => d.kind === 'audioinput' && d.deviceId === id)
       if (gone || !this.opts.micDeviceId) await this.reopen('user', 'смена микрофона')
     }
-    // Loopback binds to the default output at open time; follow Windows when it switches (speakers → headphones).
-    if (this.channels.remote) {
+    if (!this.opts) return
+    const systemDeviceId = this.opts.systemDeviceId
+    if (this.opts.captureSystem && systemDeviceId) {
+      const present = devices.some((d) => d.kind === 'audioinput' && d.deviceId === systemDeviceId)
+      if (present !== !!this.channels.remote) await this.reopen('remote', present ? 'устройство подключено' : 'устройство отключено')
+    } else if (this.channels.remote) {
+      // Loopback binds to the default output at open time; follow Windows when it switches (speakers → headphones).
       const sig = outputSignature(devices)
       if (this.outputSig !== null && sig !== this.outputSig) await this.reopen('remote', 'смена устройства вывода')
       this.outputSig = sig
@@ -279,7 +305,19 @@ async function openMic(deviceId: string | null): Promise<MediaStream> {
   })
 }
 
-async function openLoopback(): Promise<MediaStream> {
+async function openSystemAudio(deviceId: string | null): Promise<MediaStream> {
+  if (deviceId) {
+    return navigator.mediaDevices.getUserMedia({
+      audio: {
+        deviceId: { exact: deviceId },
+        channelCount: 1,
+        // Virtual mixers already process their audio; microphone DSP can suppress the remote voice.
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      }
+    })
+  }
   const s = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true })
   for (const v of s.getVideoTracks()) {
     v.stop()
@@ -291,7 +329,7 @@ async function openLoopback(): Promise<MediaStream> {
 
 /** «Слышит ли меня / собеседника?»: short level probe without ASR. */
 export async function probeLevel(source: Source, deviceId: string | null, ms = 4000, onLevel?: (v: number) => void): Promise<number> {
-  const stream = source === 'user' ? await openMic(deviceId) : await openLoopback()
+  const stream = source === 'user' ? await openMic(deviceId) : await openSystemAudio(deviceId)
   const ctx = new AudioContext()
   const an = ctx.createAnalyser()
   an.fftSize = 1024

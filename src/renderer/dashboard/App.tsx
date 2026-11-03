@@ -53,6 +53,7 @@ export function App() {
           void capture.current.start({
             sessionId: m.sessionId,
             micDeviceId: st.audio.micDeviceId,
+            systemDeviceId: st.audio.systemDeviceId,
             captureMic: st.audio.captureMic && st.consent.mic,
             captureSystem: st.audio.captureSystem && st.consent.system
           })
