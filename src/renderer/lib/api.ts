@@ -13,7 +13,9 @@ import type {
   ResumableSession,
   ScreenTask,
   SessionSummary,
-  Settings
+  Settings,
+  PlaybackDevice,
+  SystemAudioMessage
 } from '@shared/types'
 
 interface Bridge {
@@ -22,6 +24,7 @@ interface Bridge {
   onSettings(cb: (s: Settings) => void): () => void
   onAsr(cb: (s: AsrStatus) => void): () => void
   onCapture(cb: (m: CaptureMsg) => void): () => void
+  onSystemAudio(cb: (m: SystemAudioMessage) => void): () => void
   onScroll(cb: (dir: number) => void): () => void
   onPickerInit(cb: (m: PickerInit) => void): () => void
   sendAudio(m: unknown): void
@@ -69,6 +72,11 @@ const call = km.invoke
 export const api = {
   state: () => call<InitialState>('km:getState'),
   patchSettings: (p: DeepPartial<Settings>) => call<Settings>('km:settings:patch', p),
+  systemAudio: {
+    devices: () => call<PlaybackDevice[]>('km:system-audio:devices'),
+    start: (token: string, deviceId: string) => call<{ label: string }>('km:system-audio:start', token, deviceId),
+    stop: (token: string) => call<void>('km:system-audio:stop', token)
+  },
   providers: {
     list: () => call<ProviderConfig[]>('km:providers:list'),
     upsert: (cfg: ProviderConfig, apiKey?: string | null) => call<{ provider: ProviderConfig; warning: string | null }>('km:providers:upsert', cfg, apiKey),

@@ -32,6 +32,7 @@ import type {
   Source
 } from '@shared/types'
 import { AsrAssets, type AsrBackend } from './asr/assets'
+import { NativeLoopback } from './audio/loopback'
 import { AsrManager } from './asr/manager'
 import { SileroGate } from './asr/silero'
 import { BudgetManager } from './budget/budget'
@@ -69,6 +70,7 @@ app.setPath('userData', existsSync(newData) ? newData : oldData)
 if (!app.requestSingleInstanceLock()) process.exit(0)
 
 const dataDir = app.getPath('userData')
+const systemAudio = new NativeLoopback(app.isPackaged ? join(process.resourcesPath, 'loopback.exe') : join(app.getAppPath(), 'resources/bin/loopback.exe'))
 mkdirSync(dataDir, { recursive: true })
 
 const guard = new NetGuard()
@@ -244,6 +246,9 @@ function showDashboard(): void {
 
 function makeDashboard(): BrowserWindow {
   const w = createDashboard()
+  w.on('closed', () => systemAudio.stopAll())
+  w.webContents.on('render-process-gone', () => systemAudio.stopAll())
+  w.webContents.on('did-start-loading', () => systemAudio.stopAll())
   let trayHintShown = false
   const toTray = () => {
     w.hide()
@@ -540,6 +545,24 @@ function handle(channel: string, fn: (...args: never[]) => unknown): void {
 }
 
 function registerIpc(): void {
+  for (const action of ['devices', 'start', 'stop'] as const) {
+    ipcMain.handle(`km:system-audio:${action}`, async (event, token: string, deviceId: string) => {
+      if (event.sender !== dashboard?.webContents) return { ok: false, error: 'Недопустимое окно захвата' }
+      try {
+        const value =
+          action === 'devices'
+            ? await systemAudio.devices()
+            : action === 'stop'
+              ? await systemAudio.stop(token)
+              : await systemAudio.start(token, deviceId, (message) => {
+                  if (!event.sender.isDestroyed()) event.sender.send('km:system-audio', message)
+                })
+        return { ok: true, value }
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) }
+      }
+    })
+  }
   handle('km:getState', () => ({
     snapshot: sessionMgr.snap,
     settings: s(),
@@ -819,6 +842,7 @@ app.whenReady().then(() => {
 
 app.on('second-instance', showDashboard)
 app.on('before-quit', () => {
+  systemAudio.stopAll()
   quitting = true
   sessionMgr?.stop()
   asr?.stop()

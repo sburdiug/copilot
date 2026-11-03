@@ -1,5 +1,5 @@
 import type { Source } from '@shared/types'
-import { km } from './api'
+import { api, km } from './api'
 
 const RATE = 16000
 const FRAME = 320 // 20 ms
@@ -127,12 +127,14 @@ function toInt16(frames: Float32Array[]): Int16Array {
   return out
 }
 
-interface Channel {
-  stream: MediaStream
-  ctx: AudioContext
-  node: AudioWorkletNode
+interface AudioCapture {
+  deviceId: string | null
+  label: string
+  stop: () => Promise<void>
+}
+
+interface Channel extends AudioCapture {
   vad: Vad
-  level: number
   levelTimer: number
 }
 
@@ -150,12 +152,14 @@ export class CaptureController {
   private restarts: Record<Source, number> = { user: 0, remote: 0 }
   private reopening = new Set<Source>()
   private captureVersion = 0
+  private active = false
   private outputSig: string | null = null
-  private onDeviceChange = () => void this.handleDeviceChange()
+  private onDeviceChange = () => void this.handleDeviceChange().catch(() => {})
 
   async start(opts: CaptureOptions): Promise<void> {
     await this.stop()
     this.opts = opts
+    this.active = true
     this.restarts = { user: 0, remote: 0 }
     if (opts.captureMic) await this.open('user')
     else km.sendAudioStatus({ source: 'user', state: 'off', label: 'выключен в настройках' })
@@ -177,6 +181,7 @@ export class CaptureController {
   }
 
   async stop(): Promise<void> {
+    this.active = false
     this.captureVersion++
     navigator.mediaDevices.removeEventListener('devicechange', this.onDeviceChange)
     for (const src of Object.keys(this.channels) as Source[]) await this.close(src, true)
@@ -185,42 +190,33 @@ export class CaptureController {
 
   private async open(source: Source): Promise<void> {
     const o = this.opts
-    if (!o) return
+    if (!o || !this.active) return
     const version = this.captureVersion
     try {
-      const stream = source === 'user' ? await openMic(o.micDeviceId) : await openSystemAudio(o.systemDeviceId)
-      if (version !== this.captureVersion) {
-        for (const t of stream.getTracks()) t.stop()
-        return
-      }
-      const ctx = new AudioContext({ sampleRate: RATE, latencyHint: 'interactive' })
-      if (!workletUrl) workletUrl = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }))
-      await ctx.audioWorklet.addModule(workletUrl)
-      if (version !== this.captureVersion) {
-        for (const t of stream.getTracks()) t.stop()
-        await ctx.close().catch(() => {})
-        return
-      }
-      const node = new AudioWorkletNode(ctx, 'km-pcm')
-      ctx.createMediaStreamSource(stream).connect(node)
       const send = (u: Utterance, final: boolean) =>
         km.sendAudio({ sessionId: o.sessionId, utteranceId: u.id, source, pcm: u.pcm.buffer, startAt: u.startAt, endAt: Date.now(), final })
       const vad = new Vad(
         (u) => send(u, false),
         (u) => send(u, true)
       )
-      const ch: Channel = { stream, ctx, node, vad, level: 0, levelTimer: 0 }
-      node.port.onmessage = (e: MessageEvent<Float32Array>) => {
-        const rms = vad.push(e.data, Date.now())
-        ch.level = Math.max(ch.level * 0.85, rms)
+      let level = 0
+      const capture = await openAudio(
+        source,
+        source === 'user' ? o.micDeviceId : o.systemDeviceId,
+        (frame) => {
+          level = Math.max(level * 0.85, vad.push(frame, Date.now()))
+        },
+        (why) => void this.reopen(source, why)
+      )
+      if (version !== this.captureVersion) {
+        await capture.stop()
+        return
       }
-      ch.levelTimer = window.setInterval(() => km.sendLevel({ source, rms: ch.level }), 100)
-      for (const t of stream.getAudioTracks()) t.addEventListener('ended', () => void this.reopen(source, 'устройство отключено'))
-      this.channels[source] = ch
-      this.restarts[source] = 0 // only consecutive failures should count toward the reopen cap
+      const levelTimer = window.setInterval(() => km.sendLevel({ source, rms: level }), 100)
+      this.channels[source] = { ...capture, vad, levelTimer }
+      this.restarts[source] = 0
       if (source === 'remote' && !o.systemDeviceId) this.outputSig = outputSignature(await navigator.mediaDevices.enumerateDevices())
-      const label = stream.getAudioTracks()[0]?.label || (source === 'user' ? 'микрофон' : 'системный звук')
-      km.sendAudioStatus({ source, state: 'ok', label: source === 'remote' && !o.systemDeviceId ? 'звук вывода по умолчанию (loopback)' : label })
+      km.sendAudioStatus({ source, state: 'ok', label: capture.label })
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       km.sendAudioStatus({
@@ -238,14 +234,12 @@ export class CaptureController {
     if (source === 'remote') this.outputSig = null
     if (flush) ch.vad.flush()
     clearInterval(ch.levelTimer)
-    ch.node.port.onmessage = null
-    for (const t of ch.stream.getTracks()) t.stop()
-    await ch.ctx.close().catch(() => {})
+    await ch.stop()
     km.sendLevel({ source, rms: 0 })
   }
 
   private async reopen(source: Source, why: string): Promise<void> {
-    if (!this.opts || this.reopening.has(source) || this.restarts[source]++ > 5) return
+    if (!this.opts || !this.active || this.reopening.has(source) || this.restarts[source]++ > 5) return
     const version = this.captureVersion
     this.reopening.add(source)
     try {
@@ -259,22 +253,23 @@ export class CaptureController {
   }
 
   private async handleDeviceChange(): Promise<void> {
-    if (!this.opts) return
+    if (!this.opts || !this.active) return
+    const version = this.captureVersion
     const devices = await navigator.mediaDevices.enumerateDevices()
-    if (!this.opts) return
+    if (!this.opts || version !== this.captureVersion) return
     const mic = this.channels.user
     if (mic) {
-      const id = mic.stream.getAudioTracks()[0]?.getSettings().deviceId
-      const gone = !devices.some((d) => d.kind === 'audioinput' && d.deviceId === id)
+      const gone = !devices.some((d) => d.kind === 'audioinput' && d.deviceId === mic.deviceId)
       if (gone || !this.opts.micDeviceId) await this.reopen('user', 'смена микрофона')
     }
-    if (!this.opts) return
+    if (!this.opts || version !== this.captureVersion) return
     const systemDeviceId = this.opts.systemDeviceId
     if (this.opts.captureSystem && systemDeviceId) {
-      const present = devices.some((d) => d.kind === 'audioinput' && d.deviceId === systemDeviceId)
+      const outputs = await api.systemAudio.devices()
+      if (!this.opts || version !== this.captureVersion) return
+      const present = outputs.some((d) => d.id === systemDeviceId)
       if (present !== !!this.channels.remote) await this.reopen('remote', present ? 'устройство подключено' : 'устройство отключено')
     } else if (this.channels.remote) {
-      // Loopback binds to the default output at open time; follow Windows when it switches (speakers → headphones).
       const sig = outputSignature(devices)
       if (this.outputSig !== null && sig !== this.outputSig) await this.reopen('remote', 'смена устройства вывода')
       this.outputSig = sig
@@ -282,71 +277,108 @@ export class CaptureController {
   }
 }
 
-// Signature of the current default output + the set of outputs; it changes when Windows switches playback device.
 function outputSignature(devices: MediaDeviceInfo[]): string {
   const outs = devices.filter((d) => d.kind === 'audiooutput')
   const def = outs.find((d) => d.deviceId === 'default')
-  const ids = outs
+  return `${def?.groupId ?? ''}|${outs
     .map((d) => d.deviceId)
     .sort()
-    .join(',')
-  return `${def?.groupId ?? ''}|${ids}`
+    .join(',')}`
 }
 
-async function openMic(deviceId: string | null): Promise<MediaStream> {
-  return navigator.mediaDevices.getUserMedia({
-    audio: {
-      deviceId: deviceId ? { exact: deviceId } : undefined,
-      channelCount: 1,
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true
-    }
-  })
-}
-
-async function openSystemAudio(deviceId: string | null): Promise<MediaStream> {
-  if (deviceId) {
-    return navigator.mediaDevices.getUserMedia({
-      audio: {
-        deviceId: { exact: deviceId },
-        channelCount: 1,
-        // Virtual mixers already process their audio; microphone DSP can suppress the remote voice.
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false
-      }
+async function openAudio(
+  source: Source,
+  deviceId: string | null,
+  onFrame: (frame: Float32Array) => void,
+  onEnded: (why: string) => void
+): Promise<AudioCapture> {
+  if (source === 'remote' && deviceId) {
+    const token = crypto.randomUUID()
+    const unsubscribe = km.onSystemAudio((message) => {
+      if (message.token !== token) return
+      if (message.error) onEnded(message.error)
+      else if (message.pcm) onFrame(new Float32Array(message.pcm))
     })
+    try {
+      const { label } = await api.systemAudio.start(token, deviceId)
+      return {
+        deviceId,
+        label,
+        stop: async () => {
+          unsubscribe()
+          await api.systemAudio.stop(token)
+        }
+      }
+    } catch (e) {
+      unsubscribe()
+      throw e
+    }
   }
-  const s = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true })
-  for (const v of s.getVideoTracks()) {
-    v.stop()
-    s.removeTrack(v)
+  const stream =
+    source === 'user'
+      ? await navigator.mediaDevices.getUserMedia({
+          audio: {
+            deviceId: deviceId ? { exact: deviceId } : undefined,
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        })
+      : await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true })
+  let ctx: AudioContext | undefined
+  try {
+    for (const video of stream.getVideoTracks()) {
+      video.stop()
+      stream.removeTrack(video)
+    }
+    if (!stream.getAudioTracks().length) throw new Error('система не отдала аудиодорожку')
+    ctx = new AudioContext({ sampleRate: RATE, latencyHint: 'interactive' })
+    if (!workletUrl) workletUrl = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }))
+    await ctx.audioWorklet.addModule(workletUrl)
+    const node = new AudioWorkletNode(ctx, 'km-pcm')
+    ctx.createMediaStreamSource(stream).connect(node)
+    node.port.onmessage = (e: MessageEvent<Float32Array>) => onFrame(e.data)
+    for (const track of stream.getAudioTracks()) track.addEventListener('ended', () => onEnded('устройство отключено'))
+    return {
+      deviceId: stream.getAudioTracks()[0]?.getSettings().deviceId ?? null,
+      label: source === 'remote' ? 'звук вывода по умолчанию (loopback)' : stream.getAudioTracks()[0]?.label || 'микрофон',
+      stop: async () => {
+        node.port.onmessage = null
+        for (const track of stream.getTracks()) track.stop()
+        await ctx!.close().catch(() => {})
+      }
+    }
+  } catch (e) {
+    for (const track of stream.getTracks()) track.stop()
+    await ctx?.close().catch(() => {})
+    throw e
   }
-  if (!s.getAudioTracks().length) throw new Error('система не отдала аудиодорожку')
-  return s
 }
 
-/** «Слышит ли меня / собеседника?»: short level probe without ASR. */
+/** The probe opens exactly the same capture backend as a live session. */
 export async function probeLevel(source: Source, deviceId: string | null, ms = 4000, onLevel?: (v: number) => void): Promise<number> {
-  const stream = source === 'user' ? await openMic(deviceId) : await openSystemAudio(deviceId)
-  const ctx = new AudioContext()
-  const an = ctx.createAnalyser()
-  an.fftSize = 1024
-  ctx.createMediaStreamSource(stream).connect(an)
-  const buf = new Float32Array(an.fftSize)
   let max = 0
-  const end = Date.now() + ms
-  while (Date.now() < end) {
-    an.getFloatTimeDomainData(buf)
-    let sum = 0
-    for (const v of buf) sum += v * v
-    const rms = Math.sqrt(sum / buf.length)
-    max = Math.max(max, rms)
-    onLevel?.(rms)
-    await new Promise((r) => setTimeout(r, 80))
+  let failure: string | null = null
+  const capture = await openAudio(
+    source,
+    deviceId,
+    (frame) => {
+      let sum = 0
+      for (const sample of frame) sum += sample * sample
+      const rms = Math.sqrt(sum / frame.length)
+      max = Math.max(max, rms)
+      onLevel?.(rms)
+    },
+    (why) => {
+      failure = why
+    }
+  )
+  try {
+    await new Promise((resolve) => setTimeout(resolve, ms))
+    if (failure) throw new Error(failure)
+    return max
+  } finally {
+    await capture.stop()
   }
-  for (const t of stream.getTracks()) t.stop()
-  await ctx.close()
-  return max
 }

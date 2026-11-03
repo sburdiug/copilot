@@ -1,4 +1,13 @@
 export type Source = 'user' | 'remote'
+export interface PlaybackDevice {
+  id: string
+  label: string
+}
+export interface SystemAudioMessage {
+  token: string
+  pcm?: ArrayBuffer
+  error?: string
+}
 export type Lang = 'ru' | 'uk' | 'en'
 export type UiLang = Lang
 
